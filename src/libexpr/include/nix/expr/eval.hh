@@ -28,6 +28,7 @@
 #include <optional>
 #include <functional>
 #include <span>
+#include <vector>
 
 namespace nix {
 
@@ -436,6 +437,8 @@ public:
     /** Use front of `debugTraces`; see `runDebugRepl(error,env,expr)` */
     void runDebugRepl(const Error * error);
 
+    bool shouldTraceEvaluation() const;
+
     /**
      * Run a debug repl with the given error, environment and expression.
      * @param error The error to debug, may be nullptr.
@@ -458,6 +461,30 @@ public:
     std::map<const Hash, ref<eval_cache::EvalCache>> evalCaches;
 
 private:
+
+    struct CopyTrace
+    {
+        struct Frame
+        {
+            std::string message;
+            std::optional<std::string> pos;
+            std::optional<std::string> code;
+            bool isNixpkgsSource = false;
+            bool isInternal = false;
+        };
+
+        std::string src;
+        std::string dst;
+        bool isNixpkgsSource;
+        std::vector<Frame> frames;
+        bool hasTrigger;
+    };
+
+    const bool traceCopies;
+    std::vector<CopyTrace> copyTraces;
+
+    void recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath);
+    void writeCopyTraceReport() const;
 
     /* Cache for calls to addToStore(); maps source paths to the store
        paths. */
@@ -774,7 +801,7 @@ public:
         bool copyToStore = true,
         bool canonicalizePath = true);
 
-    StorePath copyPathToStore(NixStringContext & context, const SourcePath & path);
+    StorePath copyPathToStore(NixStringContext & context, const SourcePath & path, const PosIdx pos = noPos);
 
     /**
      * Path coercion.
