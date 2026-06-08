@@ -450,6 +450,8 @@ static bool isNixpkgsSourcePath(std::string_view line)
             auto root = std::string(line.substr(storePos, rootEnd - storePos));
             if (pathExists(std::filesystem::path(root) / "pkgs/stdenv/generic/setup.sh"))
                 return true;
+            if (pathExists(std::filesystem::path(root) / "nixos/pkgs/stdenv/generic/setup.sh"))
+                return true;
         }
 
         searchFrom = nameStart;
