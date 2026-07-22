@@ -7,6 +7,7 @@
 #include "nix/expr/value.hh"
 #include "nix/util/exit.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/json-utils.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
@@ -39,7 +40,6 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
-#include <nlohmann/json.hpp>
 #include <sstream>
 #include <cstring>
 #include <optional>
@@ -443,17 +443,12 @@ static bool isNixpkgsSourcePath(std::string_view line)
             return false;
 
         auto nameStart = storePos + storePrefix.size();
-        auto slash = line.find('/', nameStart);
-        auto delimiter = line.find_first_of(" \t\r\n:\"", nameStart);
-        auto rootEnd = std::min(
-            slash == std::string_view::npos ? line.size() : slash,
-            delimiter == std::string_view::npos ? line.size() : delimiter);
+        auto rootEnd = std::min(line.find_first_of("/ \t\r\n:\"", nameStart), line.size());
 
         if (rootEnd > nameStart) {
-            auto root = std::string(line.substr(storePos, rootEnd - storePos));
-            if (pathExists(std::filesystem::path(root) / "pkgs/stdenv/generic/setup.sh"))
-                return true;
-            if (pathExists(std::filesystem::path(root) / "nixos/pkgs/stdenv/generic/setup.sh"))
+            std::filesystem::path root(line.substr(storePos, rootEnd - storePos));
+            if (pathExists(root / "pkgs/stdenv/generic/setup.sh")
+                || pathExists(root / "nixos/pkgs/stdenv/generic/setup.sh"))
                 return true;
         }
 
@@ -461,19 +456,9 @@ static bool isNixpkgsSourcePath(std::string_view line)
     }
 }
 
-static bool isNixStorePath(std::string_view path)
-{
-    return path.starts_with("/nix/store/");
-}
-
 static bool isInternalTracePos(std::string_view pos)
 {
     return pos.find("«nix-internal»") != std::string::npos || pos.find("<nix/") != std::string::npos;
-}
-
-static std::string hintToString(const HintFmt & hint)
-{
-    return stripAnsi(hint.str());
 }
 
 static std::optional<std::string> posToString(const Pos & pos)
@@ -500,75 +485,57 @@ static std::optional<std::string> codeForPos(const Pos & pos)
     return stripAnsi(code);
 }
 
-static std::optional<std::tuple<std::string, std::optional<std::string>, std::optional<std::string>, bool, bool>>
-frameForPos(std::string message, const Pos & pos)
-{
-    if (!pos)
-        return std::nullopt;
-
-    auto posString = posToString(pos);
-    return std::tuple{
-        std::move(message),
-        posString,
-        codeForPos(pos),
-        posString && isNixpkgsSourcePath(*posString),
-        posString && isInternalTracePos(*posString),
-    };
-}
-
 void EvalState::recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath)
 {
     if (!traceCopies || settings.isReadOnly())
         return;
 
-    auto src = path.to_string();
-    auto dst = store->printStorePath(dstPath);
     std::vector<CopyTrace::Frame> frames;
 
+    auto addFrame = [&](std::string message, const Pos & framePos) {
+        if (!framePos)
+            return;
+        auto posString = posToString(framePos);
+        frames.push_back(CopyTrace::Frame{
+            .message = std::move(message),
+            .pos = posString,
+            .code = codeForPos(framePos),
+            .isNixpkgsSource = posString && isNixpkgsSourcePath(*posString),
+            .isInternal = posString && isInternalTracePos(*posString),
+        });
+    };
+
     if (pos)
-        if (auto frame = frameForPos("while coercing a path to a string", positions[pos])) {
-            auto & [message, framePos, code, isNixpkgsSource, isInternal] = *frame;
-            frames.push_back(CopyTrace::Frame{
-                .message = std::move(message),
-                .pos = std::move(framePos),
-                .code = std::move(code),
-                .isNixpkgsSource = isNixpkgsSource,
-                .isInternal = isInternal,
-            });
-        }
+        addFrame("while coercing a path to a string", positions[pos]);
 
     for (auto & trace : debugTraces)
-        if (auto frame = frameForPos(hintToString(trace.hint), trace.getPos(positions))) {
-            auto & [message, framePos, code, isNixpkgsSource, isInternal] = *frame;
-            frames.push_back(CopyTrace::Frame{
-                .message = std::move(message),
-                .pos = std::move(framePos),
-                .code = std::move(code),
-                .isNixpkgsSource = isNixpkgsSource,
-                .isInternal = isInternal,
-            });
-        }
+        addFrame(stripAnsi(trace.hint.str()), trace.getPos(positions));
 
     auto hasTrigger = !frames.empty();
     if (!hasTrigger)
-        frames.push_back(CopyTrace::Frame{
-            .message = "real copy, but no evaluator position was captured",
-            .pos = std::nullopt,
-            .code = std::nullopt,
-            .isNixpkgsSource = false,
-            .isInternal = false,
-        });
+        frames.push_back(CopyTrace::Frame{.message = "real copy, but no evaluator position was captured"});
 
-    bool nixpkgsSource = isNixpkgsSourcePath(src);
+    auto src = path.to_string();
 
     copyTraces.push_back(CopyTrace{
         .src = src,
-        .dst = dst,
-        .isNixpkgsSource = nixpkgsSource,
+        .dst = store->printStorePath(dstPath),
+        .isNixpkgsSource = isNixpkgsSourcePath(src),
         .frames = std::move(frames),
         .hasTrigger = hasTrigger,
     });
 }
+
+static constexpr char copyTraceReportCssBytes[] = {
+#embed "trace-copies-report.css"
+};
+
+static constexpr char copyTraceReportJsBytes[] = {
+#embed "trace-copies-report.js"
+};
+
+static constexpr std::string_view copyTraceReportCss{copyTraceReportCssBytes, sizeof(copyTraceReportCssBytes)};
+static constexpr std::string_view copyTraceReportJs{copyTraceReportJsBytes, sizeof(copyTraceReportJsBytes)};
 
 void EvalState::writeCopyTraceReport() const
 {
@@ -583,154 +550,54 @@ void EvalState::writeCopyTraceReport() const
 
         auto traces = copyTraces;
         std::ranges::sort(traces, {}, [](const CopyTrace & trace) {
-            return std::tuple{isNixStorePath(trace.src), trace.src, trace.dst};
+            return std::tuple{trace.src.starts_with("/nix/store/"), trace.src, trace.dst};
         });
+
         nlohmann::json frameData = nlohmann::json::array();
         nlohmann::json traceData = nlohmann::json::array();
         std::map<std::string, size_t> frameIds;
 
         for (auto & trace : traces) {
-            auto frames = nlohmann::json::array();
+            auto frameRefs = nlohmann::json::array();
             auto originFrame = std::ranges::find_if(trace.frames, [](const CopyTrace::Frame & frame) {
                 return !frame.isInternal;
             });
             auto originNixpkgs = originFrame != trace.frames.end() && originFrame->isNixpkgsSource;
+
             for (auto & frame : trace.frames) {
                 nlohmann::json frameJson = {
                     {"m", frame.message},
-                    {"p", frame.pos ? nlohmann::json(*frame.pos) : nlohmann::json(nullptr)},
-                    {"c", frame.code ? nlohmann::json(*frame.code) : nlohmann::json(nullptr)},
+                    {"p", frame.pos},
+                    {"c", frame.code},
                     {"n", frame.isNixpkgsSource},
                     {"i", frame.isInternal},
                 };
-                auto key = frameJson.dump();
-                auto [id, inserted] = frameIds.emplace(key, frameData.size());
+                auto [it, inserted] = frameIds.emplace(frameJson.dump(), frameData.size());
                 if (inserted)
                     frameData.push_back(std::move(frameJson));
-                frames.push_back(id->second);
+                frameRefs.push_back(it->second);
             }
+
             traceData.push_back({
                 {"s", trace.src},
                 {"d", trace.dst},
                 {"n", trace.isNixpkgsSource},
                 {"o", originNixpkgs},
                 {"h", trace.hasTrigger},
-                {"f", std::move(frames)},
+                {"f", std::move(frameRefs)},
             });
         }
 
         out << "<!doctype html><meta charset=utf-8><title>Copied paths</title>"
-               "<style>"
-               ":root{color-scheme:light dark}"
-               "body{font:14px/1.45 system-ui,sans-serif;margin:0;background:#f7f8fa;color:#1f2227}"
-               "main{max-width:1180px;margin:0 auto;padding:32px 24px}"
-               "p{color:#2c323c;margin:0 0 22px}"
-               ".copy{display:grid;grid-template-columns:86px minmax(0,1fr);gap:4px 12px;padding:10px 16px 0;"
-               "font-size:12px;color:#2c323c;word-break:break-all}"
-               ".copy b{color:#2c323c;font-weight:650}"
-               ".path-row{display:flex;align-items:flex-start;gap:8px;min-width:0}"
-               ".path-text{min-width:0;overflow-wrap:anywhere}"
-               ".copy-button{border:0;background:transparent;color:#61afef;padding:0;line-height:0;cursor:pointer}"
-               ".copy-button svg{display:block;width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;"
-               "stroke-linecap:round;stroke-linejoin:round}.copy-button:hover{color:#e5c07b}"
-               ".pos-row{display:flex;align-items:flex-start;gap:8px;min-width:0}"
-               ".global-tools{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}"
-               ".entry-tools{display:flex;flex-wrap:wrap;gap:8px;padding:10px 16px 0}"
-               ".toggle{display:inline-flex;align-items:center;gap:8px;border:1px solid #abb2bf;background:#fff;"
-               "color:#1f2227;border-radius:6px;padding:6px 10px;cursor:pointer}"
-               ".search{flex:1;min-width:220px;border:1px solid #abb2bf;background:#fff;color:#1f2227;"
-               "border-radius:6px;padding:6px 10px;font:inherit}"
-               ".search.regex-bad{border-color:#d19a66;color:#7a4b00}"
-               ".hide-filter{display:none}"
-               "input{accent-color:#61afef}"
-               "details{background:#fff;border:1px solid #abb2bf;border-radius:8px;margin:10px 0;overflow:hidden}"
-               "summary{cursor:pointer;font-weight:650;padding:14px 16px;word-break:break-all;display:grid;"
-               "grid-template-columns:10px minmax(0,1fr) auto;align-items:start;gap:10px}"
-               "summary::marker{content:\"\"}summary::-webkit-details-marker{display:none}"
-               "summary::before{content:\"\";width:0;height:0;margin-top:6px;border-top:4px solid transparent;"
-               "border-bottom:4px solid transparent;border-left:6px solid #4b5263}"
-               "details[open] summary::before{margin-top:7px;border-left:4px solid transparent;border-right:4px solid transparent;"
-               "border-top:6px solid #4b5263;border-bottom:0}"
-               ".summary-row{display:contents}"
-               ".summary-path{min-width:0;overflow-wrap:anywhere;word-break:normal}"
-               ".origin-tag{justify-self:end;color:#4b5263;font-size:12px;font-weight:500;white-space:nowrap}"
-               "details[open] summary{border-bottom:1px solid #abb2bf}"
-               ".frames{padding:8px 16px 16px}"
-               ".frame{position:relative;border-top:1px solid #abb2bf;padding:10px 0 10px 13px}"
-               ".frame::before{content:\"\";position:absolute;left:0;top:-1px;bottom:0;width:3px;background:#61afef}"
-               ".frame:first-child{border-top:0}.frame:first-child::before{top:0}"
-               ".message{font-weight:650}"
-               ".pos{color:#2c323c;font-size:12px;margin-top:3px;word-break:break-all}"
-               ".nixpkgs-frame{color:#2c323c}.nixpkgs-frame::before{background:#abb2bf}"
-               ".internal-frame{color:#4b5263}.internal-frame::before{background:#282c34}"
-               ".internal-frame .pos{color:#4b5263}"
-               ".missing{color:#7a4b00}.missing::before{background:#d19a66}"
-               "pre{white-space:pre-wrap;background:#101014;color:#abb2bf;margin:12px 16px 16px;padding:14px;"
-               "border-radius:6px;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}"
-               ".frames pre{margin:8px 0 0}"
-               ".hide-nixpkgs .nixpkgs-frame{display:none}"
-               ".hide-internal .internal-frame{display:none}"
-               ".hide-nixpkgs-origin .nixpkgs-origin-entry{display:none}"
-               "@media(prefers-color-scheme:dark){body{background:#101014;color:#abb2bf}p{color:#abb2bf}"
-               ".copy{color:#abb2bf}.copy b{color:#abb2bf}summary::before{border-left-color:#5c6370}"
-               "details[open] summary::before{border-left-color:transparent;border-top-color:#5c6370}.origin-tag{color:#5c6370}.frame{border-top-color:#2c323c}.pos{color:#abb2bf}"
-               ".nixpkgs-frame{color:#abb2bf}.nixpkgs-frame::before{background:#abb2bf}"
-               ".internal-frame{color:#abb2bf}.internal-frame::before{background:#282c34}.internal-frame .pos{color:#abb2bf}"
-               ".missing{color:#d19a66}.missing::before{background:#d19a66}"
-               ".toggle{background:#1f2227;border-color:#2c323c;color:#abb2bf}"
-               ".search{background:#1f2227;border-color:#2c323c;color:#abb2bf}"
-               ".search.regex-bad{border-color:#d19a66;color:#d19a66}"
-               "details{background:#1f2227;"
-               "border-color:#2c323c}details[open] summary{border-color:#2c323c}pre{background:#101014}}"
-               "</style>"
-               "<main><p>"
-            << traces.size()
-            << " copied path(s)</p><div class=global-tools>"
-               "<input id=search class=search type=search placeholder=\"filter by source path\" autocomplete=off>"
-               "<label class=toggle><input id=search-regex type=checkbox>regex</label>"
-               "<label class=toggle><input id=show-nixpkgs-origin type=checkbox>"
-               "show entries originating from nixpkgs</label></div><div id=entries class=hide-nixpkgs-origin></div><script>const frames="
-            << scriptSafeJson(frameData) << ",traces=" << scriptSafeJson(traceData)
-            << ";const E=document.getElementById('entries');"
-               "const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};"
-               "const copyIcon=()=>{const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 24 24');"
-               "for(const d of ['M8 8h10v12H8z','M6 16H4V4h12v2']){const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',d);s.append(p)}return s};"
-               "const copyBtn=x=>{const b=el('button','copy-button');b.type='button';b.title='copy';b.setAttribute('aria-label','copy');b.append(copyIcon());b.onclick=async()=>{"
-               "try{await navigator.clipboard.writeText(x)}catch(e){const t=document.createElement('textarea');t.value=x;"
-               "document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}"
-               "b.title='copied';setTimeout(()=>b.title='copy',900)};return b};"
-               "const pathRow=x=>{const r=el('span','path-row'),s=el('span','path-text',x);r.append(s,copyBtn(x));return r};"
-               "const renderEntry=(d,t)=>{if(d.dataset.rendered)return;d.dataset.rendered='true';"
-               "const c=el('div','copy');c.append(el('b',null,'source'),pathRow(t.s),el('b',null,'store path'),pathRow(t.d));d.append(c);"
-               "const tools=el('div','entry-tools');"
-               "const nl=el('label','toggle'),ni=document.createElement('input');ni.className='show-nixpkgs-lines';ni.type='checkbox';ni.checked=true;nl.append(ni,'show nixpkgs frames');"
-               "const il=el('label','toggle'),ii=document.createElement('input');ii.className='show-internal-lines';ii.type='checkbox';il.append(ii,'show internal frames');tools.append(nl,il);d.append(tools);"
-               "const fs=el('div','frames');"
-               "for(const id of t.f){const f=frames[id],r=el('div','frame'+(f.n?' nixpkgs-frame':'')+(f.i?' internal-frame':'')+(t.h?'':' missing'));"
-               "r.append(el('div','message',f.m));"
-               "if(f.p!=null){const p=el('div','pos'),pr=el('span','pos-row'),pt=el('span','path-text',f.p);pr.append(pt,copyBtn(f.p));p.append(pr);r.append(p)}"
-               "if(f.c!=null)r.append(el('pre',null,f.c));fs.append(r)}"
-               "d.append(fs);"
-               "const u=()=>d.classList.toggle('hide-nixpkgs',!ni.checked);ni.onchange=u;u();"
-               "const v=()=>d.classList.toggle('hide-internal',!ii.checked);ii.onchange=v;v();"
-               "};"
-               "for(const t of traces){"
-               "const d=el('details','hide-internal'+(t.o?' nixpkgs-origin-entry':''));d.dataset.nixpkgsSource=t.n;d.dataset.nixpkgsOrigin=t.o;d.dataset.src=t.s;"
-               "const sm=el('summary'),sr=el('span','summary-row'),sp=el('span','summary-path',t.s);sr.append(sp);"
-               "if(t.o)sr.append(el('span','origin-tag','nixpkgs'));sm.append(sr);d.append(sm);"
-               "d.ontoggle=()=>{if(d.open)renderEntry(d,t)};"
-               "E.append(d);"
-               "}"
-               "const ot=document.getElementById('show-nixpkgs-origin'),so=()=>E.classList.toggle('hide-nixpkgs-origin',!ot.checked);"
-               "ot.onchange=so;so();addEventListener('pageshow',so);"
-               "const sf=document.getElementById('search'),sr=document.getElementById('search-regex'),"
-               "af=()=>{const q=sf.value;let m;if(!q)m=null;"
-               "else if(sr.checked){try{const re=new RegExp(q,'i');m=s=>re.test(s);sf.classList.remove('regex-bad')}"
-               "catch(e){sf.classList.add('regex-bad');m=null}}"
-               "else{sf.classList.remove('regex-bad');const ql=q.toLowerCase();m=s=>s.toLowerCase().includes(ql)}"
-               "for(const d of E.children)d.classList.toggle('hide-filter',m&&!m(d.dataset.src))};"
-               "sf.oninput=af;sr.onchange=af;"
-               "</script></main>";
+            << "<style>" << copyTraceReportCss << "</style>"
+            << "<main><p>" << traces.size() << " copied path(s)</p>"
+            << R"(<div class=global-tools>)"
+               R"(<input id=search class=search type=search placeholder="filter by source path" autocomplete=off>)"
+               R"(<label class=toggle><input id=search-regex type=checkbox>regex</label>)"
+               R"(<label class=toggle><input id=show-nixpkgs-origin type=checkbox>show entries originating from nixpkgs</label>)"
+               "</div><div id=entries class=hide-nixpkgs-origin></div>"
+            << "<script>const frames=" << scriptSafeJson(frameData) << ",traces=" << scriptSafeJson(traceData) << ";"
+            << copyTraceReportJs << "</script></main>";
     } catch (...) {
     }
 }

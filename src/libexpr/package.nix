@@ -54,6 +54,8 @@ mkMesonLibrary (finalAttrs: {
     (fileset.fileFilter (file: file.hasExt "hh") ./.)
     ./lexer.l
     ./parser.y
+    ./trace-copies-report.css
+    ./trace-copies-report.js
     (fileset.difference (fileset.fileFilter (file: file.hasExt "nix") ./.) ./package.nix)
   ];
 
