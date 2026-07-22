@@ -51,13 +51,8 @@ const renderEntry = (d, t) => {
   if (d.dataset.rendered) return;
   d.dataset.rendered = "true";
 
-  const c = el("div", "copy");
-  c.append(
-    el("b", null, "source"),
-    pathRow(t.s),
-    el("b", null, "store path"),
-    pathRow(t.d),
-  );
+  const c = el("div", "fields");
+  for (const [k, v] of t.e) c.append(el("b", null, k), pathRow(v));
   d.append(c);
 
   const tools = el("div", "entry-tools");

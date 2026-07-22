@@ -316,6 +316,7 @@ EvalState::EvalState(
     , debugStop(false)
     , trylevel(0)
     , traceCopies(getEnv("NIX_TRACE_COPIES").value_or("0") != "0")
+    , traceIFD(getEnv("NIX_TRACE_IFD").value_or("0") != "0")
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -394,7 +395,10 @@ EvalState::EvalState(
 EvalState::~EvalState()
 {
     if (traceCopies)
-        writeCopyTraceReport();
+        writeTraceReport("trace-copies", "Copied paths", "copied path(s)", "filter by source path", copyTraces);
+    if (traceIFD)
+        writeTraceReport(
+            "trace-ifd", "Imports from derivation", "import(s) from derivation", "filter by derivation", ifdTraces);
 }
 
 static std::string scriptSafeJson(const nlohmann::json & json)
@@ -421,7 +425,7 @@ static std::string stripAnsi(std::string_view s)
     return out;
 }
 
-static std::string copyTraceTimestamp()
+static std::string traceReportTimestamp()
 {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -485,18 +489,16 @@ static std::optional<std::string> codeForPos(const Pos & pos)
     return stripAnsi(code);
 }
 
-void EvalState::recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath)
+std::vector<EvalState::EvalTrace::Frame>
+EvalState::collectTraceFrames(const PosIdx pos, std::string_view triggerMessage)
 {
-    if (!traceCopies || settings.isReadOnly())
-        return;
-
-    std::vector<CopyTrace::Frame> frames;
+    std::vector<EvalTrace::Frame> frames;
 
     auto addFrame = [&](std::string message, const Pos & framePos) {
         if (!framePos)
             return;
         auto posString = posToString(framePos);
-        frames.push_back(CopyTrace::Frame{
+        frames.push_back(EvalTrace::Frame{
             .message = std::move(message),
             .pos = posString,
             .code = codeForPos(framePos),
@@ -506,51 +508,86 @@ void EvalState::recordCopyTrace(const PosIdx pos, const SourcePath & path, const
     };
 
     if (pos)
-        addFrame("while coercing a path to a string", positions[pos]);
+        addFrame(std::string(triggerMessage), positions[pos]);
 
     for (auto & trace : debugTraces)
         addFrame(stripAnsi(trace.hint.str()), trace.getPos(positions));
 
+    return frames;
+}
+
+void EvalState::recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath)
+{
+    if (!traceCopies || settings.isReadOnly())
+        return;
+
+    auto frames = collectTraceFrames(pos, "while coercing a path to a string");
+
     auto hasTrigger = !frames.empty();
     if (!hasTrigger)
-        frames.push_back(CopyTrace::Frame{.message = "real copy, but no evaluator position was captured"});
+        frames.push_back(EvalTrace::Frame{.message = "real copy, but no evaluator position was captured"});
 
     auto src = path.to_string();
 
-    copyTraces.push_back(CopyTrace{
-        .src = src,
-        .dst = store->printStorePath(dstPath),
+    copyTraces.push_back(EvalTrace{
+        .subject = src,
+        .fields = {{"source", src}, {"store path", store->printStorePath(dstPath)}},
         .isNixpkgsSource = isNixpkgsSourcePath(src),
         .frames = std::move(frames),
         .hasTrigger = hasTrigger,
     });
 }
 
-static constexpr char copyTraceReportCssBytes[] = {
-#embed "trace-copies-report.css"
-};
-
-static constexpr char copyTraceReportJsBytes[] = {
-#embed "trace-copies-report.js"
-};
-
-static constexpr std::string_view copyTraceReportCss{copyTraceReportCssBytes, sizeof(copyTraceReportCssBytes)};
-static constexpr std::string_view copyTraceReportJs{copyTraceReportJsBytes, sizeof(copyTraceReportJsBytes)};
-
-void EvalState::writeCopyTraceReport() const
+void EvalState::recordIFDTrace(const std::string & drv)
 {
-    if (copyTraces.empty())
+    if (!traceIFD)
+        return;
+
+    auto frames = collectTraceFrames(noPos, "");
+
+    auto hasTrigger = !frames.empty();
+    if (!hasTrigger)
+        frames.push_back(EvalTrace::Frame{.message = "import from derivation, but no evaluator position was captured"});
+
+    ifdTraces.push_back(EvalTrace{
+        .subject = drv,
+        .fields = {{"derivation", drv}},
+        .isNixpkgsSource = false,
+        .frames = std::move(frames),
+        .hasTrigger = hasTrigger,
+    });
+}
+
+static constexpr char traceReportCssBytes[] = {
+#embed "trace-report.css"
+};
+
+static constexpr char traceReportJsBytes[] = {
+#embed "trace-report.js"
+};
+
+static constexpr std::string_view traceReportCss{traceReportCssBytes, sizeof(traceReportCssBytes)};
+static constexpr std::string_view traceReportJs{traceReportJsBytes, sizeof(traceReportJsBytes)};
+
+void EvalState::writeTraceReport(
+    std::string_view filePrefix,
+    std::string_view pageTitle,
+    std::string_view countLabel,
+    std::string_view searchPlaceholder,
+    const std::vector<EvalTrace> & allTraces) const
+{
+    if (allTraces.empty())
         return;
 
     try {
-        auto filename = "trace-copies-" + copyTraceTimestamp() + ".html";
+        auto filename = std::string(filePrefix) + "-" + traceReportTimestamp() + ".html";
         std::ofstream out(filename);
         if (!out)
             return;
 
-        auto traces = copyTraces;
-        std::ranges::sort(traces, {}, [](const CopyTrace & trace) {
-            return std::tuple{trace.src.starts_with("/nix/store/"), trace.src, trace.dst};
+        auto traces = allTraces;
+        std::ranges::sort(traces, {}, [](const EvalTrace & trace) {
+            return std::tuple{trace.subject.starts_with("/nix/store/"), trace.subject, trace.fields};
         });
 
         nlohmann::json frameData = nlohmann::json::array();
@@ -559,7 +596,7 @@ void EvalState::writeCopyTraceReport() const
 
         for (auto & trace : traces) {
             auto frameRefs = nlohmann::json::array();
-            auto originFrame = std::ranges::find_if(trace.frames, [](const CopyTrace::Frame & frame) {
+            auto originFrame = std::ranges::find_if(trace.frames, [](const EvalTrace::Frame & frame) {
                 return !frame.isInternal;
             });
             auto originNixpkgs = originFrame != trace.frames.end() && originFrame->isNixpkgsSource;
@@ -579,8 +616,8 @@ void EvalState::writeCopyTraceReport() const
             }
 
             traceData.push_back({
-                {"s", trace.src},
-                {"d", trace.dst},
+                {"s", trace.subject},
+                {"e", trace.fields},
                 {"n", trace.isNixpkgsSource},
                 {"o", originNixpkgs},
                 {"h", trace.hasTrigger},
@@ -588,16 +625,18 @@ void EvalState::writeCopyTraceReport() const
             });
         }
 
-        out << "<!doctype html><meta charset=utf-8><title>Copied paths</title>"
-            << "<style>" << copyTraceReportCss << "</style>"
-            << "<main><p>" << traces.size() << " copied path(s)</p>"
+        out << "<!doctype html><meta charset=utf-8><title>" << pageTitle << "</title>"
+            << "<style>" << traceReportCss << "</style>"
+            << "<main><p>" << traces.size() << " " << countLabel << "</p>"
             << R"(<div class=global-tools>)"
-               R"(<input id=search class=search type=search placeholder="filter by source path" autocomplete=off>)"
+               R"(<input id=search class=search type=search placeholder=")"
+            << searchPlaceholder
+            << R"(" autocomplete=off>)"
                R"(<label class=toggle><input id=search-regex type=checkbox>regex</label>)"
                R"(<label class=toggle><input id=show-nixpkgs-origin type=checkbox>show entries originating from nixpkgs</label>)"
                "</div><div id=entries class=hide-nixpkgs-origin></div>"
             << "<script>const frames=" << scriptSafeJson(frameData) << ",traces=" << scriptSafeJson(traceData) << ";"
-            << copyTraceReportJs << "</script></main>";
+            << traceReportJs << "</script></main>";
     } catch (...) {
     }
 }
@@ -1010,7 +1049,7 @@ bool EvalState::canDebug()
 
 bool EvalState::shouldTraceEvaluation() const
 {
-    return debugRepl || traceCopies;
+    return debugRepl || traceCopies || traceIFD;
 }
 
 void EvalState::runDebugRepl(const Error * error)

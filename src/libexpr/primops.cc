@@ -122,6 +122,9 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 
         if (settings.traceImportFromDerivation)
             warn("built '%1%' during evaluation due to an import from derivation", drvs.begin()->to_string(*store));
+
+        for (auto & drv : drvs)
+            recordIFDTrace(drv.to_string(*store));
     }
 
     /* Build/substitute the context. */

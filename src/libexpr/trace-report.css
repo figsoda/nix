@@ -22,7 +22,7 @@ p {
   margin: 0 0 22px;
 }
 
-.copy {
+.fields {
   display: grid;
   grid-template-columns: 86px minmax(0, 1fr);
   gap: 4px 12px;
@@ -32,7 +32,7 @@ p {
   word-break: break-all;
 }
 
-.copy b {
+.fields b {
   color: #2c323c;
   font-weight: 650;
 }
@@ -305,11 +305,11 @@ pre {
     color: #abb2bf;
   }
 
-  .copy {
+  .fields {
     color: #abb2bf;
   }
 
-  .copy b {
+  .fields b {
     color: #abb2bf;
   }
 

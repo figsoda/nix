@@ -463,7 +463,7 @@ public:
 
 private:
 
-    struct CopyTrace
+    struct EvalTrace
     {
         struct Frame
         {
@@ -474,18 +474,27 @@ private:
             bool isInternal = false;
         };
 
-        std::string src;
-        std::string dst;
+        std::string subject;
+        std::vector<std::pair<std::string, std::string>> fields;
         bool isNixpkgsSource;
         std::vector<Frame> frames;
         bool hasTrigger;
     };
 
     const bool traceCopies;
-    std::vector<CopyTrace> copyTraces;
+    const bool traceIFD;
+    std::vector<EvalTrace> copyTraces;
+    std::vector<EvalTrace> ifdTraces;
 
+    std::vector<EvalTrace::Frame> collectTraceFrames(const PosIdx pos, std::string_view triggerMessage);
     void recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath);
-    void writeCopyTraceReport() const;
+    void recordIFDTrace(const std::string & drv);
+    void writeTraceReport(
+        std::string_view filePrefix,
+        std::string_view pageTitle,
+        std::string_view countLabel,
+        std::string_view searchPlaceholder,
+        const std::vector<EvalTrace> & traces) const;
 
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
