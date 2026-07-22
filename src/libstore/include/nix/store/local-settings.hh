@@ -208,7 +208,7 @@ public:
         0,
         "cores",
         R"(
-          Sets the value of the `NIX_BUILD_CORES` environment variable in the [invocation of the `builder` executable](@docroot@/store/building.md#builder-execution) of a derivation.
+          Sets the value of the `NIX_BUILD_CORES` environment variable in the [invocation of the `builder` executable](@docroot@/store/building.md#env-vars) of a derivation.
           The `builder` executable can use this variable to control its own maximum amount of parallelism.
 
           <!--
@@ -736,7 +736,7 @@ public:
      * Finds the first external derivation builder that supports this
      * derivation, or else returns a null pointer.
      */
-    const ExternalBuilder * findExternalDerivationBuilderIfSupported(const Derivation & drv);
+    const ExternalBuilder * findExternalDerivationBuilderIfSupported(const BasicDerivation & drv);
 };
 
 template<>

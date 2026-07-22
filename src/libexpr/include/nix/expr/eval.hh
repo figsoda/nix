@@ -227,7 +227,7 @@ struct StaticEvalSymbols
         line, column, functor, toString, right, wrong, structuredAttrs, json, allowedReferences, allowedRequisites,
         disallowedReferences, disallowedRequisites, maxSize, maxClosureSize, builder, args, contentAddressed, impure,
         outputHash, outputHashAlgo, outputHashMode, recurseForDerivations, description, self, epsilon, startSet,
-        operator_, key, path, prefix, outputSpecified;
+        operator_, key, path, prefix, outputSpecified, requiredSystemFeatures;
 
     Expr::AstSymbols exprSymbols;
 
@@ -280,6 +280,7 @@ struct StaticEvalSymbols
             .path = alloc.create("path"),
             .prefix = alloc.create("prefix"),
             .outputSpecified = alloc.create("outputSpecified"),
+            .requiredSystemFeatures = alloc.create("requiredSystemFeatures"),
             .exprSymbols = {
                 .sub = alloc.create("__sub"),
                 .lessThan = alloc.create("__lessThan"),
@@ -485,10 +486,6 @@ private:
 
     void recordCopyTrace(const PosIdx pos, const SourcePath & path, const StorePath & dstPath);
     void writeCopyTraceReport() const;
-
-    /* Cache for calls to addToStore(); maps source paths to the store
-       paths. */
-    const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
 
     /**
      * A cache that maps paths to "resolved" paths for importing Nix

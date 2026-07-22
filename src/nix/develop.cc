@@ -5,6 +5,7 @@
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
+#include "nix/store/build.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/store/outputs-query.hh"
@@ -219,9 +220,9 @@ struct BuildEnvironment
     }
 };
 
-const static std::string getEnvSh =
-#include "get-env.sh.gen.hh"
-    ;
+static constexpr char getEnvSh[] = {
+#embed "get-env.sh"
+};
 
 /**
  * Given an existing derivation, return the shell environment as
@@ -239,7 +240,7 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
         throw Error("'nix develop' only works on derivations that use 'bash' as their builder");
 
     auto getEnvShPath = ({
-        StringSource source{getEnvSh};
+        StringSource source{std::string_view(getEnvSh, sizeof(getEnvSh))};
         evalStore->addToStoreFromDump(
             source,
             "get-env.sh",
@@ -267,7 +268,7 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
        'buildDerivation', but that's privileged. */
     drv.name += "-env";
     drv.env.emplace("name", drv.name);
-    drv.inputSrcs.insert(std::move(getEnvShPath));
+    drv.inputs.srcs.insert(std::move(getEnvShPath));
     for (auto & [outputName, output] : drv.outputs) {
         std::visit(
             overloaded{
@@ -290,21 +291,19 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
     auto shellDrvPath = evalStore->writeDerivation(drv);
 
     /* Build the derivation. */
-    store->buildPaths(
+    store->getBuilder(evalStore)->buildPaths(
         {DerivedPath::Built{
             .drvPath = makeConstantStorePathRef(shellDrvPath),
             .outputs = OutputsSpec::All{},
         }},
-        bmNormal,
-        evalStore);
+        bmNormal);
 
     // `get-env.sh` will write its JSON output to an arbitrary output
     // path, so return the first non-empty output path.
-    for (auto & [_0, optPath] : deepQueryPartialDerivationOutputMap(*evalStore, shellDrvPath)) {
-        assert(optPath);
-        auto accessor = evalStore->requireStoreObjectAccessor(*optPath);
+    for (auto & [_0, path] : deepQueryDerivationOutputMap(*evalStore, shellDrvPath)) {
+        auto accessor = evalStore->requireStoreObjectAccessor(path);
         if (auto st = accessor->maybeLstat(CanonPath::root); st && st->fileSize.value_or(0))
-            return *optPath;
+            return path;
     }
 
     throw Error("get-env.sh failed to produce an environment");
@@ -605,7 +604,13 @@ struct CmdDevelop : Common, MixEnvironment
             // FIXME: foundMakefile is set by buildPhase, need to get
             // rid of that.
             script += fmt("foundMakefile=1\n");
-            script += fmt("runHook %1%Phase\n", *phase);
+            script +=
+                fmt("if declare -f runPhase >/dev/null; then\n"
+                    "  runPhase %1%Phase\n"
+                    "else\n"
+                    "  runHook %1%Phase\n"
+                    "fi\n",
+                    *phase);
         }
 
         else if (!command.empty()) {

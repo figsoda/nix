@@ -1,3 +1,4 @@
+#include "nix/cmd/command.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
@@ -5,6 +6,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/store/derived-path.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/mounted-source-accessor.hh"
@@ -20,6 +22,7 @@
 #include "nix/util/users.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/store/local-fs-store.hh"
+#include "nix/store/build.hh"
 #include "nix/store/globals.hh"
 
 #include <filesystem>
@@ -311,12 +314,13 @@ struct CmdFlakeInfo : CmdFlakeMetadata
     }
 };
 
-struct CmdFlakeCheck : FlakeCommand
+struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 {
     bool build = true;
     bool checkAllSystems = false;
 
     CmdFlakeCheck()
+        : MixOutLinkBase(std::nullopt)
     {
         addFlag({
             .longName = "no-build",
@@ -327,6 +331,15 @@ struct CmdFlakeCheck : FlakeCommand
             .longName = "all-systems",
             .description = "Check the outputs for all systems.",
             .handler = {&checkAllSystems, true},
+        });
+        addFlag({
+            .longName = "out-link",
+            .shortName = 'o',
+            .description =
+                "Use *path* as prefix for the symlinks to the check results. By default, no out links are created.",
+            .labels = {"path"},
+            .handler = {&outLink},
+            .completer = completePath,
         });
     }
 
@@ -518,7 +531,7 @@ struct CmdFlakeCheck : FlakeCommand
         auto checkNixOSConfiguration = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS configuration '%s'", attrPath));
-                Bindings & bindings = Bindings::emptyBindings;
+                const Bindings & bindings = Bindings::emptyBindings;
                 auto vToplevel = findAlongAttrPath(*state, "config.system.build.toplevel", bindings, v).first;
                 state->forceValue(*vToplevel, pos);
                 if (!state->isDerivation(*vToplevel))
@@ -784,6 +797,7 @@ struct CmdFlakeCheck : FlakeCommand
             });
         }
 
+        std::vector<KeyedBuildResult> results;
         if (build && !attrPathsByDrv.empty()) {
             auto keys = std::views::keys(attrPathsByDrv);
             std::vector<DerivedPath> drvPaths(keys.begin(), keys.end());
@@ -810,7 +824,8 @@ struct CmdFlakeCheck : FlakeCommand
             }
 
             Activity act(*logger, lvlInfo, actUnknown, fmt("running %d flake checks", toBuild.size()));
-            auto results = store->buildPathsWithResults(toBuild);
+            // once we get rid of the temporary hack above, this tenary operator will also go away
+            results = store->getBuilder()->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
 
             // Report build failures with attribute paths
             for (auto & result : results) {
@@ -844,6 +859,14 @@ struct CmdFlakeCheck : FlakeCommand
                 "Use '--all-systems' to check all.",
                 concatStringsSep(", ", omittedSystems));
         };
+
+        auto builtPaths =
+            results | std::views::transform([&](auto & result) { return toBuiltPath(result, getEvalStore(), store); })
+            | std::ranges::to<BuiltPaths>();
+
+        printOutPathsMaybe(builtPaths, store);
+
+        createOutLinksMaybe(builtPaths, store);
     };
 };
 
@@ -1246,7 +1269,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
 
             auto attrPathS = attrPath.resolve(*state);
 
-            Activity act(*logger, lvlInfo, actUnknown, fmt("evaluating '%s'", attrPath.to_string(*state)));
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating '%s'", attrPath.to_string(*state)));
 
             try {
                 auto recurse = [&]() {

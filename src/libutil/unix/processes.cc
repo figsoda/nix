@@ -14,7 +14,6 @@
 #include <future>
 #include <iostream>
 #include <atomic>
-using namespace std::chrono_literals;
 
 #include <grp.h>
 #include <sys/types.h>
@@ -50,11 +49,13 @@ Pid::Pid(pid_t pid)
 }
 
 Pid::~Pid()
-try {
-    if (pid != -1)
-        kill(/*allowInterrupts=*/false);
-} catch (...) {
-    ignoreExceptionInDestructor();
+{
+    try {
+        if (pid != -1)
+            kill(/*allowInterrupts=*/false);
+    } catch (...) {
+        ignoreExceptionInDestructor();
+    }
 }
 
 void Pid::operator=(pid_t pid)
@@ -77,6 +78,8 @@ int Pid::kill(bool allowInterrupts)
     debug("killing process %1%", pid);
 
     std::atomic<bool> killed = false;
+
+    using namespace std::chrono_literals;
 
     if (killTimeout > 0ms && killSignal != SIGKILL)
         killThread = std::thread([&]() {

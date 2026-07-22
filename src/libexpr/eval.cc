@@ -7,6 +7,7 @@
 #include "nix/expr/value.hh"
 #include "nix/util/exit.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/util/environment-variables.hh"
@@ -300,12 +301,14 @@ EvalState::EvalState(
     , internalFS(make_ref<MemorySourceAccessor>())
     , derivationInternal{internalFS->addFile(
           CanonPath("derivation-internal.nix"),
-#include "primops/derivation.nix.gen.hh"
-          )}
+          {
+#embed "primops/derivation.nix"
+          })}
     , importedDrvToDerivation{internalFS->addFile(
           CanonPath("imported-drv-to-derivation.nix"),
-#include "imported-drv-to-derivation.nix.gen.hh"
-          )}
+          {
+#embed "imported-drv-to-derivation.nix"
+          })}
     , store(store)
     , buildStore(buildStore ? buildStore : store)
     , inputCache(fetchers::InputCache::create())
@@ -313,7 +316,6 @@ EvalState::EvalState(
     , debugStop(false)
     , trylevel(0)
     , traceCopies(getEnv("NIX_TRACE_COPIES").value_or("0") != "0")
-    , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -369,8 +371,9 @@ EvalState::EvalState(
 
     corepkgsFS->addFile(
         CanonPath("fetchurl.nix"),
-#include "fetchurl.nix.gen.hh"
-    );
+        {
+#embed "fetchurl.nix"
+        });
 
     createBaseEnv(settings);
 
@@ -1015,27 +1018,34 @@ std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
     return {};
 }
 
+static StaticEnv::Vars lexicographicOrder(const SymbolTable & st, StaticEnv::Vars vars)
+{
+    std::ranges::sort(vars, [&st](const auto & lhs, const auto & rhs) {
+        return std::string_view(st[lhs.first]) < std::string_view(st[rhs.first]);
+    });
+    return vars;
+}
+
 // just for the current level of StaticEnv, not the whole chain.
-void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
+static void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
 {
     std::cout << ANSI_MAGENTA;
-    for (auto & i : se.vars)
-        std::cout << st[i.first] << " ";
+    for (auto & [name, displacement] : lexicographicOrder(st, se.vars))
+        std::cout << st[name] << " ";
     std::cout << ANSI_NORMAL;
     std::cout << std::endl;
 }
 
 // just for the current level of Env, not the whole chain.
-void printWithBindings(const SymbolTable & st, const Env & env)
+static void printWithBindings(const SymbolTable & st, const Env & env)
 {
     if (!env.values[0]->isThunk()) {
         std::cout << "with: ";
         std::cout << ANSI_MAGENTA;
-        auto j = env.values[0]->attrs()->begin();
-        while (j != env.values[0]->attrs()->end()) {
-            std::cout << st[j->name] << " ";
-            ++j;
-        }
+        auto * bindings = env.values[0]->attrs();
+        /* TODO: Don't print the whole attribute set, since it can be quite large. */
+        for (const Attr * attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr->name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -1056,7 +1066,7 @@ void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & 
         std::cout << ANSI_MAGENTA;
         // for the top level, don't print the double underscore ones;
         // they are in builtins.
-        for (auto & i : se.vars)
+        for (auto & i : lexicographicOrder(st, se.vars))
             if (!hasPrefix(st[i.first], "__"))
                 std::cout << st[i.first] << " ";
         std::cout << ANSI_NORMAL;
@@ -1535,7 +1545,6 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     lookupPathResolved->clear();
-    positions.clear();
     rootFS->invalidateCache();
 }
 
@@ -1706,7 +1715,11 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
         sort = true;
     }
 
-    bindings.bindings->pos = pos;
+    /* FIXME: Currently we can't track the positions of empty bindings. A way
+       to fix this is to store the position in the Value storage with more
+       clever bitpacking (we have spare 32 bits in the Bindings * variant). */
+    if (bindings.bindings != &Bindings::emptyBindings)
+        bindings.bindings->pos = pos;
 
     v.mkAttrs(sort ? bindings.finish() : bindings.alreadySorted());
 }
@@ -2574,6 +2587,8 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
     Value * recovery = nullptr;
     try {
         std::rethrow_exception(e);
+    } catch (const Interrupted & e) {
+        recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {
@@ -2591,6 +2606,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
     Value * recovery = nullptr;
     try {
         std::rethrow_exception(e);
+    } catch (const Interrupted & e) {
+        recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {
@@ -2943,24 +2960,17 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
-    auto dstPathCached = getConcurrent(*srcToStore, path);
-
-    auto dstPath = dstPathCached ? *dstPathCached : [&]() {
-        auto dstPath = fetchToStore(
-            fetchSettings,
-            *store,
-            path.resolveSymlinks(SymlinkResolution::Ancestors),
-            settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
-            path.baseName(),
-            ContentAddressMethod::Raw::NixArchive,
-            nullptr,
-            repair);
-        allowPath(dstPath);
-        srcToStore->try_emplace(path, dstPath);
-        printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
-        recordCopyTrace(pos, path, dstPath);
-        return dstPath;
-    }();
+    auto dstPath = fetchToStore(
+        fetchSettings,
+        *store,
+        path.resolveSymlinks(SymlinkResolution::Ancestors),
+        settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
+        path.baseName(),
+        ContentAddressMethod::Raw::NixArchive,
+        nullptr,
+        repair);
+    allowPath(dstPath);
+    recordCopyTrace(pos, path, dstPath);
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;

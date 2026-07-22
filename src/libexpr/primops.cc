@@ -10,7 +10,10 @@
 #include "nix/store/names.hh"
 #include "nix/store/path-references.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/configuration.hh"
 #include "nix/util/mounted-source-accessor.hh"
+#include "nix/store/build.hh"
+#include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
@@ -126,7 +129,7 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
     buildReqs.reserve(drvs.size());
     for (auto & d : drvs)
         buildReqs.emplace_back(DerivedPath{d});
-    buildStore->buildPaths(buildReqs, bmNormal, store);
+    buildStore->getBuilder(store)->buildPaths(buildReqs, bmNormal);
 
     StorePathSet outputsToCopyAndAllow;
 
@@ -251,7 +254,7 @@ void derivationToValue(
     state.evalFile(state.importedDrvToDerivation, *vImportedDrvToDerivation); // has caching
 
     v.mkApp(vImportedDrvToDerivation, w);
-    state.forceAttrs(v, pos, "while calling imported-drv-to-derivation.nix.gen.hh");
+    state.forceAttrs(v, pos, "while calling imported-drv-to-derivation.nix");
 }
 
 /**
@@ -978,6 +981,7 @@ static RegisterPrimOp primop_break(
          }
 
          // Return the value we were passed.
+         state.forceValue(*args[0], pos);
          v = *args[0];
      }});
 
@@ -1513,13 +1517,15 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             "passed to builtins.derivationStrict");
 
     /* Build the derivation expression by processing the attributes. */
-    Derivation drv;
-    drv.name = drvName;
+    Derivation drv{
+        .name = std::string{drvName},
+    };
 
     NixStringContext context;
 
     bool contentAddressed = false;
     bool isImpure = false;
+    bool isSubmittingOutputs = false;
     std::optional<std::string> outputHash;
     std::optional<HashAlgorithm> outputHashAlgo;
     std::optional<ContentAddressMethod> ingestionMethod;
@@ -1532,6 +1538,17 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             continue;
         auto key = state.symbols[i->name];
         vomit("processing attribute '%1%'", key);
+
+        // Like `warn`, but with the position of the attribute and the derivation name as an added trace.
+        auto warnAttr = [&](HintFmt msg) {
+            ErrorInfo info{
+                .level = lvlWarn,
+                .msg = std::move(msg),
+                .pos = state.positions[i->pos],
+            };
+            info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
+            logWarning(info);
+        };
 
         auto handleHashMode = [&](const std::string_view s) {
             if (s == "recursive") {
@@ -1642,40 +1659,36 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         handleOutputs(ss);
                         break;
                     }
+                    case EvalState::s.requiredSystemFeatures.getId(): {
+                        /* Only parsed to detect `builder-rpc-v0`; skip
+                           entirely unless the experimental feature is
+                           enabled. */
+                        if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
+                            break;
+                        state.forceList(*i->value, pos, context_below);
+                        for (auto elem : i->value->listView()) {
+                            auto name = state.forceString(*elem, context, pos, context_below);
+                            if (name == drvFeatureBuilderRpcV0) {
+                                isSubmittingOutputs = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
                     default:
                         break;
                     }
 
                     switch (i->name.getId()) {
                     case EvalState::s.allowedReferences.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'allowedReferences'; use 'outputChecks.<output>.allowedReferences' instead",
-                            drvName);
-                        break;
                     case EvalState::s.allowedRequisites.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'allowedRequisites'; use 'outputChecks.<output>.allowedRequisites' instead",
-                            drvName);
-                        break;
                     case EvalState::s.disallowedReferences.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'disallowedReferences'; use 'outputChecks.<output>.disallowedReferences' instead",
-                            drvName);
-                        break;
                     case EvalState::s.disallowedRequisites.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'disallowedRequisites'; use 'outputChecks.<output>.disallowedRequisites' instead",
-                            drvName);
-                        break;
                     case EvalState::s.maxSize.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'maxSize'; use 'outputChecks.<output>.maxSize' instead",
-                            drvName);
-                        break;
                     case EvalState::s.maxClosureSize.getId():
-                        warn(
-                            "In a derivation named '%s', 'structuredAttrs' disables the effect of the derivation attribute 'maxClosureSize'; use 'outputChecks.<output>.maxClosureSize' instead",
-                            drvName);
+                        warnAttr(HintFmt(
+                            "'structuredAttrs' disables the effect of the derivation attribute '%1%'; use 'outputChecks.<output>.%1%' instead",
+                            key));
                         break;
                     default:
                         break;
@@ -1683,10 +1696,18 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
                 } else {
                     auto s = state.coerceToString(pos, *i->value, context, context_below, true).toOwned();
+
+                    /* Re-interpret the attribute's value as a list of
+                       strings.
+
+                       We may wish to warn here better future-compat
+                       later, e.g. requiring that it be a list of
+                       strings without spaces to begin with. */
+                    auto forceStringList = [&] { return tokenizeString<Strings>(s); };
+
                     if (i->name == state.s.json) {
-                        warn(
-                            "In derivation '%s': setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead.",
-                            drvName);
+                        warnAttr(HintFmt(
+                            "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
                         drv.structuredAttrs = StructuredAttrs::parse(s);
                     } else {
                         drv.env.emplace(key, s);
@@ -1707,8 +1728,22 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                             handleHashMode(s);
                             break;
                         case EvalState::s.outputs.getId():
-                            handleOutputs(tokenizeString<Strings>(s));
+                            handleOutputs(forceStringList());
                             break;
+                        case EvalState::s.requiredSystemFeatures.getId(): {
+                            /* Only parsed to detect `builder-rpc-v0`; skip
+                               entirely unless the experimental feature is
+                               enabled. */
+                            if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
+                                break;
+                            for (auto & name : forceStringList()) {
+                                if (name == drvFeatureBuilderRpcV0) {
+                                    isSubmittingOutputs = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
                         default:
                             break;
                         }
@@ -1747,18 +1782,18 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                     StorePathSet refs;
                     state.store->computeFSClosure(d.drvPath, refs);
                     for (auto & j : refs) {
-                        drv.inputSrcs.insert(j);
+                        drv.inputs.srcs.insert(j);
                         if (j.isDerivation()) {
-                            drv.inputDrvs.map[j].value = state.store->readDerivation(j).outputNames();
+                            drv.inputs.drvs.map[j].value = state.store->readDerivation(j).outputNames();
                         }
                     }
                 },
                 [&](const NixStringContextElem::Built & b) {
-                    drv.inputDrvs.ensureSlot(*b.drvPath).value.insert(b.output);
+                    drv.inputs.drvs.ensureSlot(*b.drvPath).value.insert(b.output);
                 },
                 [&](const NixStringContextElem::Opaque & o) {
                     state.ensureLazyPathCopied(o.path);
-                    drv.inputSrcs.insert(o.path);
+                    drv.inputs.srcs.insert(o.path);
                 },
             },
             c.raw);
@@ -1805,7 +1840,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                 },
         };
 
-        drv.env["out"] = state.store->printStorePath(dof.path(*state.store, drvName, "out"));
+        if (!isSubmittingOutputs)
+            drv.env["out"] = state.store->printStorePath(dof.path(*state.store, drvName, "out"));
         drv.outputs.insert_or_assign("out", std::move(dof));
     }
 
@@ -1817,7 +1853,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         auto method = ingestionMethod.value_or(ContentAddressMethod::Raw::NixArchive);
 
         for (auto & i : outputs) {
-            drv.env[i] = hashPlaceholder(i);
+            if (!isSubmittingOutputs)
+                drv.env[i] = hashPlaceholder(i);
             if (isImpure)
                 drv.outputs.insert_or_assign(
                     i,
@@ -1960,25 +1997,21 @@ static void prim_storePath(EvalState & state, const PosIdx pos, Value ** args, V
             .debugThrow();
 
     NixStringContext context;
-    auto path =
-        state.coerceToPath(pos, *args[0], context, "while evaluating the first argument passed to 'builtins.storePath'")
-            .path;
-    /* Here we are leaving the realm of the rootFS accessor and must actually fetch to the store.
-       TODO: This could probably get optimised to avoid the fetching altogether to short-circuit when the path
-       is already mounted on storeFS. */
-    state.ensureLazyPathsCopied(context);
+    SourcePath sourcePath = state.coerceToPath(
+        pos, *args[0], context, "while evaluating the first argument passed to 'builtins.storePath'");
+
     /* Resolve symlinks in ‘path’, unless ‘path’ itself is a symlink
        directly in the store.  The latter condition is necessary so
        e.g. nix-push does the right thing. */
-    if (!state.store->isStorePath(path.abs()))
-        path = CanonPath(canonPath(path.abs(), true).string());
-    if (!state.store->isInStore(path.abs()))
-        state.error<EvalError>("path '%1%' is not in the Nix store", path).atPos(pos).debugThrow();
-    auto path2 = state.store->toStorePath(path.abs()).first;
-    if (!settings.readOnlyMode)
-        state.store->ensurePath(path2);
-    context.insert(NixStringContextElem::Opaque{.path = path2});
-    v.mkString(path.abs(), context, state.mem);
+    if (!state.store->isStorePath(sourcePath.path.abs()))
+        sourcePath = sourcePath.resolveSymlinks(SymlinkResolution::Full);
+    if (!state.store->isInStore(sourcePath.path.abs()))
+        state.error<EvalError>("path '%1%' is not in the Nix store", sourcePath).atPos(pos).debugThrow();
+    auto storePath = state.store->toStorePath(sourcePath.path.abs()).first;
+    if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))) && !settings.readOnlyMode)
+        state.store->getBuilder()->ensurePath(storePath);
+    context.insert(NixStringContextElem::Opaque{.path = storePath});
+    v.mkString(sourcePath.path.abs(), context, state.mem);
 }
 
 static RegisterPrimOp primop_storePath({
@@ -3089,11 +3122,7 @@ static RegisterPrimOp primop_attrNames({
       alphabetically sorted list. For instance, `builtins.attrNames { y
       = 1; x = "foo"; }` evaluates to `[ "x" "y" ]`.
 
-      # Time Complexity
-
-      - O(n log n), where:
-
-      n = number of attributes in the set
+      Has `O(n log n)` time complexity, where `n` is number of attributes in the *set*.
     )",
     .impl = prim_attrNames,
 });
@@ -3127,11 +3156,7 @@ static RegisterPrimOp primop_attrValues({
       Return the values of the attributes in the set *set* in the order
       corresponding to the sorted attribute names.
 
-      # Time Complexity
-
-      - O(n log n), where:
-
-      n = number of attributes in the set
+      Has `O(n log n)` time complexity, where `n` is number of attributes in the *set*.
     )",
     .impl = prim_attrValues,
 });
@@ -3158,9 +3183,7 @@ static RegisterPrimOp primop_getAttr({
       the `.` operator, since *s* is an expression rather than an
       identifier.
 
-      # Time Complexity
-
-      O(log n) where n = number of attributes in the set
+      Has `O(log n)` time complexity, where `n` is number of attributes in the *set*.
     )",
     .impl = prim_getAttr,
 });
@@ -3250,9 +3273,7 @@ static RegisterPrimOp primop_hasAttr({
       `false` otherwise. This is a dynamic version of the `?` operator,
       since *s* is an expression rather than an identifier.
 
-      # Time Complexity
-
-      O(log n) where n = number of attributes in the set
+      Has `O(log n)` time complexity, where `n` is number of attributes in the *set*.
     )",
     .impl = prim_hasAttr,
 });
@@ -3313,12 +3334,7 @@ static RegisterPrimOp primop_removeAttrs({
 
       evaluates to `{ y = 2; }`.
 
-      # Time Complexity
-
-      O(n + k log k) where:
-
-      n = number of attributes in input set
-      k = number of attribute names to remove
+      Has `O(n + k log k)` time complexity, where `n` is number of attributes in the *set* and `k` is the size of *list*.
     )",
     .impl = prim_removeAttrs,
 });
@@ -3407,9 +3423,7 @@ static RegisterPrimOp primop_listToAttrs({
       { foo = 123; bar = 456; }
       ```
 
-      # Time Complexity
-
-      O(n log n) where n = number of list elements
+      Has `O(n log n)` time complexity, where `n` is size of the list.
     )",
     .impl = prim_listToAttrs,
 });
@@ -3486,12 +3500,7 @@ static RegisterPrimOp primop_intersectAttrs({
       Return a set consisting of the attributes in the set *e2* which have the
       same name as some attribute in *e1*.
 
-      # Time Complexity
-
-      O(n * log m) where:
-
-      n = number of attributes in the smaller set
-      m = number of attributes in the larger set
+      Has `O(n log m)` time complexity, where `n` and `m` are the sizes of the smallest and largest set respectively.
     )",
     .impl = prim_intersectAttrs,
 });
@@ -3532,12 +3541,7 @@ static RegisterPrimOp primop_catAttrs({
 
       evaluates to `[1 2]`.
 
-      # Time Complexity
-
-      O(n * log m) where:
-
-      n = list length
-      m = number of attributes per set
+      Has `O(n)` time complexity, where `n` is the size of the *list*.
     )",
     .impl = prim_catAttrs,
 });
@@ -3582,9 +3586,7 @@ static RegisterPrimOp primop_functionArgs({
       the function. Plain lambdas are not included, e.g. `functionArgs (x:
       ...) = { }`.
 
-      # Time Complexity
-
-      O(n) where n = number of formal arguments
+      Has constant time complexity.
     )",
     .impl = prim_functionArgs,
 });
@@ -3618,13 +3620,9 @@ static RegisterPrimOp primop_mapAttrs({
 
       evaluates to `{ a = 10; b = 20; }`.
 
-      # Time Complexity
-
-      O(n) where:
-
-      n = number of attributes
-
-      Calls to `f` are performed afterwards, when needed.
+      Has `O(n)` time complexity, where `n` is the size of the *attrset*.
+      Note that no calls to *f* are performed by the builtin.
+      The function *f* is called on demand when a resulting attribute value is evaluated.
     )",
     .impl = prim_mapAttrs,
 });
@@ -3713,12 +3711,7 @@ static RegisterPrimOp primop_zipAttrsWith({
       }
       ```
 
-      # Time Complexity
-
-      O(N * log k) where:
-
-      N = total attributes across all sets
-      k = number of unique keys across all sets
+      Has `O(n log n)` time complexity, where `n` is the number of attributes across all sets.
     )",
     .impl = prim_zipAttrsWith,
 });
@@ -3786,9 +3779,7 @@ static RegisterPrimOp primop_head({
       isn’t a list or is an empty list. You can test whether a list is
       empty by comparing it with `[]`.
 
-      # Time Complexity
-
-      O(1)
+      Has constant time complexity.
     )",
     .impl = prim_head,
 });
@@ -3820,10 +3811,6 @@ static RegisterPrimOp primop_tail({
       > This function should generally be avoided since it's inefficient:
       > unlike Haskell's `tail`, it takes O(n) time, so recursing over a
       > list by repeatedly calling `tail` takes O(n^2) time.
-
-      # Time Complexity
-
-      O(n) where n = list length (copies n-1 elements)
     )",
     .impl = prim_tail,
 });
@@ -3859,13 +3846,9 @@ static RegisterPrimOp primop_map({
 
       evaluates to `[ "foobar" "foobla" "fooabc" ]`.
 
-      # Time Complexity
-
-      O(n) where:
-
-      n = list length
-
-      Calls to `f` are performed afterwards when needed.
+      Has `O(n)` time complexity, where `n` is the size of the *list*.
+      Note that no calls to *f* are performed by the builtin, but *f* itself is evaluated and its type is checked eagerly.
+      The function *f* is called on demand when a resulting list element is evaluated.
     )",
     .impl = prim_map,
 });
@@ -3915,13 +3898,7 @@ static RegisterPrimOp primop_filter({
     .doc = R"(
       Return a list consisting of the elements of *list* for which the
       function *f* returns `true`.
-
-      # Time Complexity
-
-      O(n * T_f) (eager; predicate is forced) where:
-
-      n = list length
-      T_f = predicate evaluation time
+      Has linear time complexity in the size of the input *list*.
     )",
     .impl = prim_filter,
 });
@@ -3945,15 +3922,7 @@ static RegisterPrimOp primop_elem({
     .doc = R"(
       Return `true` if a value equal to *x* occurs in the list *xs*, and
       `false` otherwise.
-
-      # Time Complexity
-
-      O(n * T) (worst case) where:
-
-      n = list length
-      T = time to compare two elements
-
-      returns early if the elements is found
+      Short-circuits and does not evaluate elements that occur in the list after the first match.
     )",
     .impl = prim_elem,
 });
@@ -3971,12 +3940,6 @@ static RegisterPrimOp primop_concatLists({
     .args = {"lists"},
     .doc = R"(
       Concatenate a list of lists into a single list.
-
-      # Time Complexity
-
-      O(N) where:
-
-      N = total number of elements across all lists
     )",
     .impl = prim_concatLists,
 });
@@ -3993,10 +3956,6 @@ static RegisterPrimOp primop_length({
     .args = {"e"},
     .doc = R"(
       Return the length of the list *e*.
-
-      # Time Complexity
-
-      O(1)
     )",
     .impl = prim_length,
 });
@@ -4062,12 +4021,7 @@ static RegisterPrimOp primop_foldlStrict({
       but lacks these benefits.
       See also [Nixpkgs `lib.foldl`](https://nixos.org/manual/nixpkgs/unstable/#function-library-lib.lists.foldl).
 
-      # Time Complexity
-
-      O(n * T_op) where:
-
-      n = list length
-      T_op = `op` call evaluation time
+      Has linear time complexity in the size of the list.
     )",
     .impl = prim_foldlStrict,
 });
@@ -4106,15 +4060,7 @@ static RegisterPrimOp primop_any({
     .doc = R"(
       Return `true` if the function *pred* returns `true` for at least one
       element of *list*, and `false` otherwise.
-
-      # Time Complexity
-
-      O(n * T_pred) where:
-
-      - n = `list` length
-      - T_pred = `pred` call evaluation time
-
-      returns early when `pred` returns `true`
+      Short-circuits and does not evaluate elements that appear later in the list if `pred` evaluates to `true`.
     )",
     .impl = prim_any,
 });
@@ -4130,15 +4076,7 @@ static RegisterPrimOp primop_all({
     .doc = R"(
       Return `true` if the function *pred* returns `true` for all elements
       of *list*, and `false` otherwise.
-
-      # Time Complexity
-
-      O(n * T_f) where:
-
-      - n = list length
-      - T_f = predicate evaluation time
-
-      returns early when `pred` returns `false`
+      Short-circuits and does not evaluate elements that appear later in the list if `pred` evaluates to `false`.
     )",
     .impl = prim_all,
 });
@@ -4178,16 +4116,7 @@ static RegisterPrimOp primop_genList({
 
       returns the list `[ 0 1 4 9 16 ]`.
 
-      # Time Complexity
-
-      Complexity of `genList generator n`: O(n)
-
-      Complexity of `deepSeq (genList generator n)`: O(n * T_f)
-
-      where:
-
-      n = requested length
-      T_f = `generator` call evaluation time
+      Has linear time complexity.
     )",
     .impl = prim_genList,
 });
@@ -4299,15 +4228,8 @@ static RegisterPrimOp primop_sort({
       If the *comparator* violates any of these properties, then `builtins.sort`
       reorders elements in an unspecified manner.
 
-      # Time Complexity
-
-      O(n log n * T_cmp), where:
-
-      n = `list` length
-      T_cmp = `comparator` call evaluation time
-
-      Uses an adaptive sort that exploits existing sorted runs in the input,
-      down to O(n * T_cmp) when the list is already sorted.
+      Runs in `O(n log n)` time on average, where `n` is the size of the *list*.
+      Uses an adaptive sort that exploits existing sorted runs in the input, down to `O(n)` when the list is already sorted.
     )",
     .impl = prim_sort,
 });
@@ -4370,12 +4292,7 @@ static RegisterPrimOp primop_partition({
       { right = [ 23 42 ]; wrong = [ 1 9 3 ]; }
       ```
 
-      # Time Complexity
-
-      O(n * T_pred) where:
-
-      n = list length
-      T_pred = `pred` call evaluation time
+      Runs in linear time in the size of the *list*.
     )",
     .impl = prim_partition,
 });
@@ -4430,13 +4347,7 @@ static RegisterPrimOp primop_groupBy({
       { b = [ "bar" "baz" ]; f = [ "foo" ]; }
       ```
 
-      # Time Complexity
-
-      O(N * T_f + N * log k) where:
-
-      N = number of `list` elements
-      T_f = `f` call evaluation time
-      k = number of unique groups
+      Has `O(n log n)` time complexity, where `n` is the size of the input *list*.
     )",
     .impl = prim_groupBy,
 });
@@ -4479,14 +4390,6 @@ static RegisterPrimOp primop_concatMap({
     .doc = R"(
       This function is equivalent to `builtins.concatLists (map f list)`
       but is more efficient.
-
-      # Time Complexity
-
-      O(k * T_f + N) where:
-
-      k = length of input list
-      T_f = time to call `f` on an element
-      N = total number of elements returned by `f` calls
     )",
     .impl = prim_concatMap,
 });
@@ -5190,13 +5093,6 @@ static RegisterPrimOp primop_concatStringsSep({
       Concatenate a list of strings with a separator between each
       element, e.g. `concatStringsSep "/" ["usr" "local" "bin"] ==
       "usr/local/bin"`.
-
-      # Time Complexity
-
-      O(n + m) (amortized) where:
-
-      n = number of list elements
-      m = total length of output string
     )",
     .impl = prim_concatStringsSep,
 });
@@ -5282,13 +5178,7 @@ static RegisterPrimOp primop_replaceStrings({
 
       evaluates to `"fabir"`.
 
-      # Time Complexity
-
-      O(n * k * c) (worst case) where:
-
-      n = length of input string
-      k = number of replacement patterns
-      c = average length of patterns in 'from' list
+      Has `O(n k)` time complexity, where `n` is the length of *s* and `k` is the number of replacements.
     )",
     .impl = prim_replaceStrings,
 });

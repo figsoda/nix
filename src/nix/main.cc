@@ -161,7 +161,7 @@ struct NixArgs : virtual MultiCommand, virtual MixCommonArgs, virtual RootArgs
             {"make-content-addressable", {AliasStatus::Deprecated, {"store", "make-content-addressed"}}},
             {"optimise-store", {AliasStatus::Deprecated, {"store", "optimise"}}},
             {"ping-store", {AliasStatus::Deprecated, {"store", "info"}}},
-            {"realisation", {AliasStatus::Deprecated, {"build-trace"}}},
+            {"realisation", {AliasStatus::Deprecated, {"store", "build-trace"}}},
             {"sign-paths", {AliasStatus::Deprecated, {"store", "sign"}}},
             {"shell", {AliasStatus::AcceptedShorthand, {"env", "shell"}}},
             {"show-derivation", {AliasStatus::Deprecated, {"derivation", "show"}}},
@@ -257,24 +257,29 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
     auto vGenerateManpage = state.allocValue();
     state.eval(
         state.parseExprFromString(
-#include "generate-manpage.nix.gen.hh"
-            , state.rootPath(CanonPath::root)),
+            {
+#embed "doc/manual/generate-manpage.nix"
+            },
+            state.rootPath(CanonPath::root)),
         *vGenerateManpage);
 
     state.corepkgsFS->addFile(
         CanonPath("utils.nix"),
-#include "utils.nix.gen.hh"
-    );
+        {
+#embed "doc/manual/utils.nix"
+        });
 
     state.corepkgsFS->addFile(
         CanonPath("/generate-settings.nix"),
-#include "generate-settings.nix.gen.hh"
-    );
+        {
+#embed "doc/manual/generate-settings.nix"
+        });
 
     state.corepkgsFS->addFile(
         CanonPath("/generate-store-info.nix"),
-#include "generate-store-info.nix.gen.hh"
-    );
+        {
+#embed "doc/manual/generate-store-info.nix"
+        });
 
     auto vDump = state.allocValue();
     vDump->mkString(toplevel.dumpCli(), state.mem);
@@ -348,9 +353,9 @@ struct CmdHelpStores : Command
 
     std::string doc() override
     {
-        return
-#include "help-stores.md.gen.hh"
-            ;
+        return {
+#embed "help-stores.md"
+        };
     }
 
     Category category() override
@@ -398,15 +403,8 @@ void mainWrapped(int argc, char ** argv)
     flakeSettings.configureEvalSettings(evalSettings);
 
 #ifdef __linux__
-    if (isRootUser()) {
-        try {
-            saveMountNamespace();
-            if (unshare(CLONE_NEWNS) == -1)
-                throw SysError("setting up a private mount namespace");
-        } catch (Error & e) {
-            warn("failed to set up a private mount namespace: %s", e.msg());
-        }
-    }
+    if (isRootUser())
+        tryEnterPrivateMountNamespace();
 #endif
 
     Finally f([] { logger->stop(); });
@@ -551,7 +549,13 @@ void mainWrapped(int argc, char ** argv)
     if (!args.command)
         throw UsageError("no subcommand specified");
 
-    experimentalFeatureSettings.require(args.command->second->experimentalFeature());
+    {
+        MultiCommand * command = &args;
+        while (command && command->command) {
+            experimentalFeatureSettings.require(command->command->second->experimentalFeature());
+            command = dynamic_cast<MultiCommand *>(&*command->command->second);
+        }
+    }
 
     if (args.useNet && !haveInternet()) {
         warn("you don't have Internet access; disabling some network-dependent features");

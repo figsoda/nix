@@ -1,9 +1,3 @@
-configure_file(
-  input : 'config.nix.in',
-  output : 'config.nix',
-  configuration : test_confdata,
-)
-
 suites += {
   'name' : 'dyn-drv',
   'deps' : [],
@@ -16,6 +10,9 @@ suites += {
     'dep-built-drv.sh',
     'old-daemon-error-hack.sh',
     'dep-built-drv-2.sh',
+    'dep-built-drv-submitted.sh',
+    'submit-failure.sh',
+    'submit-reference.sh',
   ],
   'workdir' : meson.current_source_dir(),
 }

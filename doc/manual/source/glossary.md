@@ -104,7 +104,7 @@
 
   A derivation can be thought of as a [pure function](https://en.wikipedia.org/wiki/Pure_function) that produces new [store objects][store object] from existing store objects.
 
-  Derivations are implemented as [operating system processes that run in a sandbox](@docroot@/store/building.md#builder-execution).
+  Derivations are implemented as [operating system processes that run in a sandbox](@docroot@/store/building.md).
   This sandbox by default only allows reading from store objects specified as inputs, and only allows writing to designated [outputs][output] to be [captured as store objects](@docroot@/store/building.md#processing-outputs).
 
   A derivation is typically specified as a [derivation expression] in the [Nix language], and [instantiated][instantiate] to a [store derivation].
@@ -169,6 +169,11 @@
 
   A [store derivation] where a cryptographic hash of the [output] is determined in advance using the [`outputHash`](./language/advanced-attributes.md#adv-attr-outputHash) attribute, and where the [`builder`](@docroot@/language/derivations.md#attr-builder) executable has access to the network.
 
+- [hermetic]{#gloss-hermetic}
+
+  An evaluation or build process is hermetic when one can mechanically identify the set of all inputs that may affect it.
+  At the build level this is achieved by sandboxing; at the evaluation level by restricting impure access (as in [pure evaluation](@docroot@/command-ref/conf-file.md#conf-pure-eval)) together with [locking](#gloss-locking) or [pinning](#gloss-pinning) of the fetched inputs, taken transitively over [pure fetches](@docroot@/command-ref/conf-file.md#pure-fetch).
+
 - [IFD]{#gloss-ifd}
 
   [Import From Derivation](./language/import-from-derivation.md)
@@ -200,6 +205,10 @@
   See [`nix-instantiate`](./command-ref/nix-instantiate.md), which produces a store derivation from a Nix expression that evaluates to a derivation.
 
   [instantiate]: #gloss-instantiate
+
+- [locking]{#gloss-locking}
+
+  In package management, *locking* is the concept or process of creating a lock file, which maps each mutable evaluation input to an immutable reference, so that future evaluations resolve to the same immutable versions rather than whatever the mutable references currently point to.
 
 - [Nix Archive (NAR)]{#gloss-nar}
 
@@ -269,6 +278,16 @@
   The exact shape of these attribute sets is up to convention.
 
   [package]: #package
+
+- [pinning]{#gloss-pinning}
+
+  Like [locking](#gloss-locking), but a pin only locks a single input.
+  A pinning solution may manage a collection of pins,
+  but serves the bottom-up purpose of fixing an input's reference on demand,
+  whereas locking implies a top down approach where all pins are "coerced" into a single place.
+  This "coercion" is generally achieved by means of high-level mechanisms such as programming language module systems.
+  Nix does not have such a restrictive module system, as even a flake can use expressions that pin or lock on their own.
+  It does not rely on the lock being total, but on a transitive fetching property; see [hermeticity](#gloss-hermetic).
 
 - [profile]{#gloss-profile}
 
@@ -374,6 +393,13 @@
   [string]: ./language/types.md#type-string
   [path]: ./language/types.md#type-path
   [attribute name]: ./language/types.md#type-attrs
+
+- [SRI]{#gloss-sri}
+
+  [Subresource Integrity](https://www.w3.org/TR/SRI/) (SRI) is a [W3C specification](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity) for integrity metadata.
+  Nix uses the SRI hash format (`<algorithm>-<Base64 hash>`) to specify content hashes in a way that is self-describing, since the hash algorithm is part of the format.
+
+  [SRI]: #gloss-sri
 
 - [substitute]{#gloss-substitute}
 
