@@ -144,7 +144,7 @@ summary {
   padding: 14px 16px;
   word-break: break-all;
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) auto;
+  grid-template-columns: 10px minmax(0, 1fr) auto auto;
   align-items: start;
   gap: 10px;
 }
@@ -191,6 +191,30 @@ details[open] summary::before {
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
+}
+
+.dup-count {
+  justify-self: end;
+  color: #abb2bf;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.group-entries {
+  padding: 8px 16px 16px;
+}
+
+.group-entries>details:first-child {
+  margin-top: 0;
+}
+
+.group-entries>details:last-child {
+  margin-bottom: 0;
+}
+
+.group-entries .summary-path {
+  font-weight: 500;
 }
 
 details[open] summary {

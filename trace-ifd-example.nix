@@ -13,5 +13,6 @@ let
 in
 ''
   ${show "greeting" (import generated).greeting}
+  ${show "greeting2" (import generated).greeting}
   ${show "message" (builtins.readFile message)}
 ''

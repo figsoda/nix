@@ -101,29 +101,93 @@ const renderEntry = (d, t) => {
   v();
 };
 
-for (const t of traces) {
+const buildEntry = (t, count, label) => {
   const d = el(
     "details",
     "hide-internal" + (t.o ? " nixpkgs-origin-entry" : ""),
   );
-  d.dataset.nixpkgsSource = t.n;
-  d.dataset.nixpkgsOrigin = t.o;
-  d.dataset.src = t.s;
   const sm = el("summary"),
     sr = el("span", "summary-row");
-  sr.append(el("span", "summary-path", t.s));
+  sr.append(el("span", "summary-path", label));
+  if (count > 1) sr.append(el("span", "dup-count", "\u00d7" + count));
   if (t.o) sr.append(el("span", "origin-tag", "nixpkgs"));
   sm.append(sr);
   d.append(sm);
   d.ontoggle = () => {
     if (d.open) renderEntry(d, t);
   };
+  return d;
+};
+
+const entryLabel = (t) => {
+  let fallback = null;
+  for (const id of t.f) {
+    const f = frames[id];
+    if (f.p == null) continue;
+    if (!f.i) return f.p;
+    if (fallback == null) fallback = f.p;
+  }
+  return fallback != null ? fallback : frames[t.f[0]].m;
+};
+
+const groups = new Map();
+for (const t of traces) {
+  const k = JSON.stringify([t.s, t.e]);
+  let g = groups.get(k);
+  if (!g) groups.set(k, (g = []));
+  g.push(t);
+}
+
+const groupBadges = [];
+
+for (const g of groups.values()) {
+  const t = g[0];
+  const dupCounts = new Map(),
+    uniques = [];
+  for (const x of g) {
+    const k = JSON.stringify([x.h, x.f]);
+    if (!dupCounts.has(k)) {
+      dupCounts.set(k, 0);
+      uniques.push([k, x]);
+    }
+    dupCounts.set(k, dupCounts.get(k) + 1);
+  }
+
+  let d;
+  if (uniques.length === 1) {
+    d = buildEntry(t, g.length, t.s);
+  } else {
+    d = el("details", "entry-group");
+    if (g.every((x) => x.o)) d.classList.add("nixpkgs-origin-entry");
+    const badge = el("span", "dup-count");
+    groupBadges.push({
+      badge,
+      total: g.length,
+      nonNixpkgs: g.filter((x) => !x.o).length,
+    });
+    const sm = el("summary"),
+      sr = el("span", "summary-row");
+    sr.append(el("span", "summary-path", t.s), badge);
+    if (g.every((x) => x.o)) sr.append(el("span", "origin-tag", "nixpkgs"));
+    sm.append(sr);
+    d.append(sm);
+    const inner = el("div", "group-entries");
+    for (const [k, x] of uniques)
+      inner.append(buildEntry(x, dupCounts.get(k), entryLabel(x)));
+    d.append(inner);
+  }
+  d.dataset.nixpkgsSource = t.n;
+  d.dataset.src = t.s;
   E.append(d);
 }
 
 const originToggle = document.getElementById("show-nixpkgs-origin");
-const showOrigin = () =>
-  E.classList.toggle("hide-nixpkgs-origin", !originToggle.checked);
+const showOrigin = () => {
+  const on = originToggle.checked;
+  E.classList.toggle("hide-nixpkgs-origin", !on);
+  for (const { badge, total, nonNixpkgs } of groupBadges)
+    badge.textContent = "\u00d7" + (on ? total : nonNixpkgs);
+};
 originToggle.onchange = showOrigin;
 showOrigin();
 addEventListener("pageshow", showOrigin);

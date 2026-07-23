@@ -49,6 +49,7 @@
 #include <functional>
 #include <ranges>
 #include <mutex>
+#include <set>
 
 #include <nlohmann/json.hpp>
 #include <boost/container/small_vector.hpp>
@@ -593,6 +594,7 @@ void EvalState::writeTraceReport(
         nlohmann::json frameData = nlohmann::json::array();
         nlohmann::json traceData = nlohmann::json::array();
         std::map<std::string, size_t> frameIds;
+        std::set<std::string> uniqueTraces;
 
         for (auto & trace : traces) {
             auto frameRefs = nlohmann::json::array();
@@ -600,6 +602,13 @@ void EvalState::writeTraceReport(
                 return !frame.isInternal;
             });
             auto originNixpkgs = originFrame != trace.frames.end() && originFrame->isNixpkgsSource;
+
+            /* A trace that begins with an internal frame was triggered by
+               evaluator machinery (e.g. derivationStrict coercing derivation
+               attributes) rather than by the code below it on the stack, so
+               classify by the subject path instead. */
+            if (!originNixpkgs && !trace.frames.empty() && trace.frames.front().isInternal)
+                originNixpkgs = trace.isNixpkgsSource;
 
             for (auto & frame : trace.frames) {
                 nlohmann::json frameJson = {
@@ -623,11 +632,15 @@ void EvalState::writeTraceReport(
                 {"h", trace.hasTrigger},
                 {"f", std::move(frameRefs)},
             });
+            uniqueTraces.insert(nlohmann::json{trace.subject, trace.fields}.dump());
         }
 
         out << "<!doctype html><meta charset=utf-8><title>" << pageTitle << "</title>"
             << "<style>" << traceReportCss << "</style>"
-            << "<main><p>" << traces.size() << " " << countLabel << "</p>"
+            << "<main><p>" << traces.size() << " " << countLabel;
+        if (uniqueTraces.size() < traces.size())
+            out << " (" << uniqueTraces.size() << " unique)";
+        out << "</p>"
             << R"(<div class=global-tools>)"
                R"(<input id=search class=search type=search placeholder=")"
             << searchPlaceholder
